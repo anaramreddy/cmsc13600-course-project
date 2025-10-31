@@ -1,0 +1,283 @@
+# app/models.py
+# CloudySky – Hand-crafted data model for HW3
+#
+# Notes:
+# - Uses Django's auth_user for credentials and a separate UserType model (as required).
+# - Moderation is tracked via ModerationAction + denormalized flags on Post/Comment.
+# - Media can attach to either Post or Comment via GenericForeignKey.
+# - Avatars are a dedicated model per user; the "current" avatar is the one with is_active=True.
+# - Byte counts are stored for analytics; content length is computed on save.
+# - All timestamps are timezone-aware; created_at/updated_at provided via TimeStampedModel.
+#
+# After adding this file:
+#   (venv) $ python manage.py makemigrations app
+#   (venv) $ python manage.py migrate
+
+from __future__ import annotations
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
+from django.core.validators import FileExtensionValidator
+from django.db import models
+from django.utils import timezone
+
+User = get_user_model()
+
+
+class TimeStampedModel(models.Model):
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+
+# ---- Users & Roles ---------------------------------------------------------
+
+class UserType(models.Model):
+    """Tracks whether a Django auth.User is a 'serf' or an 'administrator'."""
+    ROLE_SERF = "serf"
+    ROLE_ADMIN = "admin"
+    ROLE_CHOICES = [
+        (ROLE_SERF, "Serf"),
+        (ROLE_ADMIN, "Administrator"),
+    ]
+
+    user = models.OneToOneField(User, related_name="usertype", on_delete=models.CASCADE)
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES, default=ROLE_SERF)
+
+    def __str__(self):
+        return f"{self.user.username} ({self.role})"
+
+
+class UserProfile(TimeStampedModel):
+    """Public user page data (bio + current avatar pointer)."""
+    user = models.OneToOneField(User, related_name="profile", on_delete=models.CASCADE)
+    bio = models.TextField(blank=True)
+    # denormalized convenience pointer to the current avatar (optional)
+    current_avatar = models.ForeignKey(
+        "Avatar",
+        related_name="+",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    def __str__(self):
+        return f"Profile<{self.user.username}>"
+
+
+# ---- Moderation ------------------------------------------------------------
+
+class SuppressionReason(models.Model):
+    """Canonical list of vetted removal reasons shown to authors."""
+    code = models.SlugField(max_length=64, unique=True)   # e.g., 'disallowed-topic'
+    title = models.CharField(max_length=128)              # short label
+    description = models.TextField()                      # what the author sees
+    active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"{self.code}: {self.title}"
+
+
+class ModerationAction(TimeStampedModel):
+    """A single moderation action (hide/unhide) applied to a post or comment."""
+    ACTION_HIDE_POST = "hide_post"
+    ACTION_HIDE_COMMENT = "hide_comment"
+    ACTION_UNHIDE_POST = "unhide_post"
+    ACTION_UNHIDE_COMMENT = "unhide_comment"
+    ACTION_CHOICES = [
+        (ACTION_HIDE_POST, "Hide post"),
+        (ACTION_HIDE_COMMENT, "Hide comment"),
+        (ACTION_UNHIDE_POST, "Unhide post"),
+        (ACTION_UNHIDE_COMMENT, "Unhide comment"),
+    ]
+
+    # The moderator performing the action (must be admin)
+    moderator = models.ForeignKey(User, on_delete=models.PROTECT, related_name="moderation_actions")
+
+    # Target: Generic to allow moderating posts or comments
+    target_content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    target_object_id = models.PositiveIntegerField()
+    target = GenericForeignKey("target_content_type", "target_object_id")
+
+    action = models.CharField(max_length=32, choices=ACTION_CHOICES)
+    reason = models.ForeignKey(SuppressionReason, on_delete=models.SET_NULL, null=True, blank=True)
+    message_to_author = models.TextField(blank=True)  # optional moderator note user can see
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["target_content_type", "target_object_id"]),
+        ]
+
+
+# ---- Core: Posts & Comments -----------------------------------------------
+
+class Post(TimeStampedModel):
+    """Top-level feed item."""
+    author = models.ForeignKey(User, related_name="posts", on_delete=models.CASCADE)
+    body = models.TextField()
+    body_bytes = models.PositiveIntegerField(default=0)  # analytics: length in bytes
+    # For simple sorting; spec suggests chronological by original posting date.
+    posted_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    # Moderation flags (denormalized for fast filtering in views/API)
+    is_suppressed = models.BooleanField(default=False, db_index=True)
+    suppressed_at = models.DateTimeField(null=True, blank=True)
+    suppressed_reason = models.ForeignKey(
+        SuppressionReason, null=True, blank=True, on_delete=models.SET_NULL, related_name="suppressed_posts"
+    )
+    suppressed_message_to_author = models.TextField(blank=True)
+
+    def save(self, *args, **kwargs):
+        # Update analytics byte count on save
+        self.body_bytes = len(self.body.encode("utf-8")) if self.body else 0
+        super().save(*args, **kwargs)
+
+    def visible_to(self, user: User) -> bool:
+        """Serfs see non-suppressed content, but authors and admins see their own suppressed posts."""
+        if self.is_suppressed:
+            if not user.is_authenticated:
+                return False
+            if getattr(user, "usertype", None) and user.usertype.role == UserType.ROLE_ADMIN:
+                return True
+            return user == self.author
+        return True
+
+    def __str__(self):
+        return f"Post<{self.id}> by {self.author}"
+
+
+class Comment(TimeStampedModel):
+    """Comment on a post. Placeholder displayed when suppressed."""
+    post = models.ForeignKey(Post, related_name="comments", on_delete=models.CASCADE)
+    author = models.ForeignKey(User, related_name="comments", on_delete=models.CASCADE)
+    body = models.TextField()
+    body_bytes = models.PositiveIntegerField(default=0)   # analytics
+    commented_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    # Moderation flags
+    is_suppressed = models.BooleanField(default=False, db_index=True)
+    suppressed_at = models.DateTimeField(null=True, blank=True)
+    suppressed_reason = models.ForeignKey(
+        SuppressionReason, null=True, blank=True, on_delete=models.SET_NULL, related_name="suppressed_comments"
+    )
+    suppressed_message_to_author = models.TextField(blank=True)
+
+    def save(self, *args, **kwargs):
+        self.body_bytes = len(self.body.encode("utf-8")) if self.body else 0
+        super().save(*args, **kwargs)
+
+    def visible_to(self, user: User) -> bool:
+        """Serfs see placeholder if suppressed; author & admins see original."""
+        if self.is_suppressed:
+            if not user.is_authenticated:
+                return False
+            if getattr(user, "usertype", None) and user.usertype.role == UserType.ROLE_ADMIN:
+                return True
+            return user == self.author or user == self.post.author
+        return True
+
+    def display_text_for(self, user: User) -> str:
+        """Returns placeholder text when suppressed for typical viewers."""
+        if self.is_suppressed and not (
+            getattr(user, "usertype", None) and user.usertype.role == UserType.ROLE_ADMIN
+            or (user.is_authenticated and (user == self.author or user == self.post.author))
+        ):
+            return "This comment has been removed by a moderator."
+        return self.body
+
+    def __str__(self):
+        return f"Comment<{self.id}> by {self.author} on Post<{self.post_id}>"
+    
+
+# ---- Media & Avatars -------------------------------------------------------
+
+def avatar_upload_path(instance: "Avatar", filename: str) -> str:
+    return f"avatars/user_{instance.user_id}/{timezone.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
+
+def media_upload_path(instance: "Media", filename: str) -> str:
+    # Organized by model type + id for easy GC
+    target = f"{instance.target_content_type.model}_{instance.target_object_id}" if instance.target_object_id else "orphan"
+    return f"media/{target}/{timezone.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
+
+
+class Avatar(TimeStampedModel):
+    """User-uploaded avatar; only one should be active at a time."""
+    user = models.ForeignKey(User, related_name="avatars", on_delete=models.CASCADE)
+    image = models.ImageField(
+        upload_to=avatar_upload_path,
+        validators=[FileExtensionValidator(allowed_extensions=["jpg", "jpeg", "png", "gif", "webp"])],
+    )
+    is_active = models.BooleanField(default=True)
+    image_bytes = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        indexes = [models.Index(fields=["user", "is_active"])]
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # File size after save (when file exists)
+        try:
+            self.image_bytes = self.image.size or 0
+        except Exception:
+            self.image_bytes = 0
+        super().save(update_fields=["image_bytes"])
+
+    def __str__(self):
+        return f"Avatar<{self.id}> for {self.user}"
+
+
+class Media(TimeStampedModel):
+    """
+    Uploads attached to Posts or Comments (images first; could be extended to video/other).
+    Uses GenericForeignKey so one table covers both relationships.
+    """
+    IMAGE = "image"
+    FILETYPE_CHOICES = [
+        (IMAGE, "Image"),
+        # potential future types: 'video', 'audio', 'doc'
+    ]
+
+    uploader = models.ForeignKey(User, related_name="uploaded_media", on_delete=models.CASCADE)
+    filetype = models.CharField(max_length=16, choices=FILETYPE_CHOICES, default=IMAGE)
+
+    file = models.FileField(
+        upload_to=media_upload_path,
+        validators=[FileExtensionValidator(allowed_extensions=["jpg", "jpeg", "png", "gif", "webp"])],
+    )
+    file_bytes = models.PositiveIntegerField(default=0)
+
+    # Attach to a Post or Comment
+    target_content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE, null=True, blank=True)
+    target_object_id = models.PositiveIntegerField(null=True, blank=True)
+    target = GenericForeignKey("target_content_type", "target_object_id")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["target_content_type", "target_object_id"]),
+            models.Index(fields=["uploader", "created_at"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        try:
+            self.file_bytes = self.file.size or 0
+        except Exception:
+            self.file_bytes = 0
+        super().save(update_fields=["file_bytes"])
+
+    def __str__(self):
+        tgt = f"{self.target_content_type.model}#{self.target_object_id}" if self.target_object_id else "unattached"
+        return f"Media<{self.id}> {tgt}"
+
+
+# ---- Helpful query utilities (optional) ------------------------------------
+
+class ActivityWindow:
+    """Constants (in days) for dashboard summarization."""
+    LAST_1_DAY = 1
+    LAST_7_DAYS = 7
+    LAST_30_DAYS = 30
